@@ -281,6 +281,24 @@ class LanguageModel(nn.Module):
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
+
+        # Check if sequence was truncated - if image_grid_thw implies more tokens
+        # than we have, fall back to simple sequential positions for training stability
+        if image_grid_thw is not None:
+            expected_image_tokens = 0
+            for grid in image_grid_thw:
+                t, h, w = grid[0].item(), grid[1].item(), grid[2].item()
+                expected_image_tokens += t * (h // spatial_merge_size) * (w // spatial_merge_size)
+            actual_image_tokens = mx.sum(input_ids == image_token_id).item()
+            if expected_image_tokens > actual_image_tokens:
+                # Sequence was truncated - use simple sequential positions
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(
+                    position_ids, (3, batch_size, seq_length)
+                )
+                mrope_position_deltas = mx.zeros([batch_size, 1], dtype=input_ids.dtype)
+                return position_ids, mrope_position_deltas
+
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
         ):
@@ -292,8 +310,19 @@ class LanguageModel(nn.Module):
             )
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
+                # Get the attention mask for this batch item
+                attn_mask_i = attention_mask[i]
+
+                # Align lengths if they differ (can happen due to inconsistent truncation)
+                seq_len_i = input_ids.shape[0]
+                if attn_mask_i.shape[0] != seq_len_i:
+                    min_len = min(attn_mask_i.shape[0], seq_len_i)
+                    input_ids = input_ids[:min_len]
+                    attn_mask_i = attn_mask_i[:min_len]
+                    seq_len_i = min_len
+
                 input_ids = mx.where(
-                    attention_mask[i] == 1, input_ids, mx.zeros_like(input_ids)
+                    attn_mask_i == 1, input_ids, mx.zeros_like(input_ids)
                 )
                 image_nums, video_nums = 0, 0
                 vision_start_indices = mx.sum(
@@ -398,24 +427,27 @@ class LanguageModel(nn.Module):
                     llm_pos_ids_list.append(t_index + st_idx)
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                mask = mx.array(attention_mask[i] == 1)
+                mask = mx.array(attn_mask_i == 1)
                 expanded_mask = mx.expand_dims(mask, axis=0)
                 expanded_mask = mx.broadcast_to(expanded_mask, (3, 1, mask.shape[0]))
                 expanded_positions = mx.expand_dims(llm_positions, axis=1)
+
+                # Slice position_ids to match the (possibly truncated) sequence length
+                pos_ids_slice = position_ids[:, i : i + 1, :seq_len_i]
                 new_positions = mx.where(
-                    expanded_mask, expanded_positions, position_ids[:, i : i + 1, :]
+                    expanded_mask, expanded_positions, pos_ids_slice
                 )
                 updated_position_ids = mx.concatenate(
                     [
-                        position_ids[:, :i, :],
+                        position_ids[:, :i, :seq_len_i],
                         new_positions,
-                        position_ids[:, i + 1 :, :],
+                        position_ids[:, i + 1 :, :seq_len_i],
                     ],
                     axis=1,
                 )
                 position_ids = updated_position_ids
                 mrope_position_deltas.append(
-                    llm_positions.max() + 1 - len(total_input_ids[i])
+                    llm_positions.max() + 1 - seq_len_i
                 )
             mrope_position_deltas = mx.array(mrope_position_deltas)[0]
             return position_ids, mrope_position_deltas

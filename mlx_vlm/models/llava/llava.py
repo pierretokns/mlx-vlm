@@ -81,30 +81,32 @@ class Model(nn.Module):
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
     ):
+        """Merge image features into text embeddings using interleaving approach.
+
+        This handles the case where each image produces many patches (e.g., 576)
+        but the input only has a single <image> token per image.
+        """
         image_token_index = self.config.image_token_index
+        num_images, num_image_patches, embed_dim = image_features.shape
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
+        # Find positions of <image> tokens in input_ids (assuming batch size is 1)
         image_positions = np.where(input_ids == image_token_index)[1].tolist()
-        num_images, _, vision_hidden_size = image_features.shape
 
-        reshaped_image_hidden_states = image_features.reshape(-1, vision_hidden_size)
+        # Build text segments between image positions
+        text_segments = []
+        start_idx = 0
+        for position in image_positions:
+            text_segments.append(inputs_embeds[:, start_idx:position])
+            start_idx = position + 1
 
-        # cast to the dtype of the input_embeds to support quantized models
-        reshaped_image_hidden_states = reshaped_image_hidden_states.astype(
-            inputs_embeds.dtype
-        )
+        # Split image features per image
+        image_embeddings = mx.split(image_features, image_features.shape[0])
 
-        # Pad image_positions to match the length of reshaped_image_hidden_states
-        num_positions_needed = len(image_positions)
+        # Interleave text and images
+        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
+        final_embeddings += [inputs_embeds[:, start_idx:]]
 
-        if reshaped_image_hidden_states.shape[0] > num_positions_needed:
-            # TODO: Think about how to handle this case
-            raise ValueError(
-                "Llava model supports only one image per input. Please check your input_ids and pixel_values."
-            )
-
-        inputs_embeds[:, image_positions, :] = reshaped_image_hidden_states
-        return inputs_embeds
+        return mx.concatenate(final_embeddings, axis=1)
 
     @property
     def layers(self):
