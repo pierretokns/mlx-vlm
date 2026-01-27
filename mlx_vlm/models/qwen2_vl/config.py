@@ -62,12 +62,18 @@ class ModelConfig(BaseModelConfig):
     model_type: str
     ignore_index: int = -100
     image_token_id: int = 151655
+    image_token_index: Optional[int] = None  # For trainer compatibility
     video_token_id: int = 151656
     vision_start_token_id: int = 151652
     vision_feature_select_strategy: str = "default"
     vision_feature_layer: int = -2
     vocab_size: int = 32000
     eos_token_id: Optional[List[int]] = None
+
+    def __post_init__(self):
+        # Map image_token_id to image_token_index for trainer compatibility
+        if self.image_token_index is None:
+            self.image_token_index = self.image_token_id
 
     @classmethod
     def from_dict(cls, params):
