@@ -40,6 +40,7 @@ class Dataset:
         take=None,
         split=None,
         image_resize_shape=None,
+        max_seq_length=None,
     ):
         if split is not None:
             self.dataset = hf_dataset[split]
@@ -51,6 +52,8 @@ class Dataset:
         self.config = config
         self.image_processor = image_processor
         self.image_resize_shape = image_resize_shape
+        # Default to 680 to avoid gradient vanishing bug at longer sequences
+        self.max_seq_length = max_seq_length if max_seq_length is not None else 680
 
     def __len__(self):
         return len(self.dataset)
@@ -110,6 +113,11 @@ class Dataset:
         if mask is None:
             mask = mx.ones_like(input_ids)
 
+        # Truncate to max_seq_length to avoid gradient vanishing bug
+        if self.max_seq_length is not None and input_ids.shape[1] > self.max_seq_length:
+            input_ids = input_ids[:, :self.max_seq_length]
+            mask = mask[:, :self.max_seq_length]
+
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
@@ -120,18 +128,44 @@ class Dataset:
 
 def grad_checkpoint(layer):
     """
-    Update all instances of type(layer) to use gradient checkpointing.
+    Apply gradient checkpointing to a single layer instance.
+
+    This patches the instance's __call__ method directly, avoiding the nested
+    wrapper bug that occurs when the original class-level patching is applied
+    to multiple layers of the same type. The original implementation modified
+    type(layer).__call__, which meant each subsequent layer would capture the
+    already-wrapped version, creating deeply nested checkpoints that corrupt
+    gradient recomputation state.
+
+    With instance-level patching, each layer gets exactly one checkpoint wrapper,
+    ensuring correct gradient flow through all layers.
     """
-    fn = type(layer).__call__
+    import types
 
-    def checkpointed_fn(model, *args, **kwargs):
+    # Get the ORIGINAL class method, not any previously wrapped version
+    # We need to get it from the class's __dict__ or MRO to avoid getting
+    # an already-patched instance method
+    original_class = type(layer)
+
+    # Find the original __call__ from the class hierarchy
+    original_call = None
+    for cls in original_class.__mro__:
+        if '__call__' in cls.__dict__:
+            original_call = cls.__dict__['__call__']
+            break
+
+    if original_call is None:
+        raise RuntimeError(f"Could not find __call__ method for {original_class}")
+
+    def checkpointed_call(self, *args, **kwargs):
         def inner_fn(params, *args, **kwargs):
-            model.update(params)
-            return fn(model, *args, **kwargs)
+            self.update(params)
+            return original_call(self, *args, **kwargs)
 
-        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+        return mx.checkpoint(inner_fn)(self.trainable_parameters(), *args, **kwargs)
 
-    type(layer).__call__ = checkpointed_fn
+    # Patch the instance, not the class
+    layer.__call__ = types.MethodType(checkpointed_call, layer)
 
 
 @dataclass
