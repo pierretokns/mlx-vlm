@@ -148,7 +148,11 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
             raise ValueError("The adapter does not have lora params in the config")
 
     # TODO: add lora params to the config and load them here
-    list_of_modules = find_all_linear_names(model.language_model.model)
+    # Handle different model architectures - some have language_model.model, others just language_model
+    language_model = model.language_model
+    if hasattr(language_model, 'model'):
+        language_model = language_model.model
+    list_of_modules = find_all_linear_names(language_model)
     if config is not None:
         model = get_peft_model(model, list_of_modules, **config)
     else:
