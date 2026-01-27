@@ -55,6 +55,20 @@ class Dataset:
         # Default to 680 to avoid gradient vanishing bug at longer sequences
         self.max_seq_length = max_seq_length if max_seq_length is not None else 680
 
+        # Fix for idefics3/smolvlm: disable image splitting to avoid token/feature mismatch
+        # When do_image_splitting=True, the tokenizer creates N*S image tokens where N is
+        # the number of tiles, but prepare_inputs may produce different feature counts.
+        # Disabling splitting ensures 1 tile = consistent token count.
+        model_type = config.get("model_type", "")
+        if model_type in ("idefics3", "smolvlm"):
+            if hasattr(processor, "image_processor") and hasattr(
+                processor.image_processor, "do_image_splitting"
+            ):
+                processor.image_processor.do_image_splitting = False
+                warnings.warn(
+                    f"Disabled do_image_splitting for {model_type} to fix token/feature mismatch"
+                )
+
     def __len__(self):
         return len(self.dataset)
 
