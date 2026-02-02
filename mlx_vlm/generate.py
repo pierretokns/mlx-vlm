@@ -425,6 +425,17 @@ def stream_generate(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
+    # Apply chat template if the prompt is a raw string (not already formatted)
+    # This mirrors what _generate_batch does but was missing from stream_generate
+    if isinstance(prompt, str) and image is not None:
+        num_images = len(image) if isinstance(image, list) else 1
+        prompt = apply_chat_template(
+            processor,
+            model.config,
+            prompt,
+            num_images=num_images,
+        )
+
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
         pixel_values = kwargs.pop("pixel_values", None)

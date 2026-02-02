@@ -328,6 +328,15 @@ def load(
     if image_processor is not None:
         processor.image_processor = image_processor
 
+    # Fix for mlx-community LFM2-VL models: their preprocessor_config.json
+    # incorrectly sets input_data_format="channels_last" and uses
+    # Siglip2ImageProcessor instead of Lfm2VlImageProcessorFast. This causes
+    # torchvision normalize to receive (H,W,C) tensors when it expects (C,H,W).
+    # Setting to None lets the processor auto-detect the correct format.
+    if hasattr(processor, "image_processor") and hasattr(processor.image_processor, "input_data_format"):
+        if processor.image_processor.input_data_format == "channels_last":
+            processor.image_processor.input_data_format = None
+
     return model, processor
 
 
@@ -786,6 +795,24 @@ def process_inputs(
     return process_method(**args)
 
 
+def _convert_pt_to_mlx(data):
+    """Convert PyTorch tensors in a dict to MLX arrays."""
+    try:
+        import torch
+    except ImportError:
+        return data
+
+    converted = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            converted[key] = mx.array(value.detach().cpu().numpy())
+        elif isinstance(value, (list, tuple)) and len(value) > 0 and isinstance(value[0], torch.Tensor):
+            converted[key] = [mx.array(t.detach().cpu().numpy()) for t in value]
+        else:
+            converted[key] = value
+    return converted
+
+
 def process_inputs_with_fallback(
     processor,
     prompts,
@@ -807,10 +834,10 @@ def process_inputs_with_fallback(
             **kwargs,
         )
     except Exception as e:
-        # Fallback to PyTorch tensors if MLX fails
+        # Fallback to PyTorch tensors if MLX fails, then convert to MLX
         if return_tensors != "pt":
             try:
-                return process_inputs(
+                result = process_inputs(
                     processor,
                     prompts=prompts,
                     images=images,
@@ -819,6 +846,7 @@ def process_inputs_with_fallback(
                     return_tensors="pt",
                     **kwargs,
                 )
+                return _convert_pt_to_mlx(result)
             except Exception as fallback_error:
                 raise ValueError(
                     f"Failed to process inputs with error: {fallback_error}"
