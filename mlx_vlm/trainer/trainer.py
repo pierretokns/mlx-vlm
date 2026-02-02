@@ -1,13 +1,45 @@
 import json
+import math
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import Callable, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
+
+
+def create_lr_schedule(
+    base_lr: float,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.1,
+) -> Callable[[int], float]:
+    """Create warmup + cosine decay learning rate schedule.
+
+    Args:
+        base_lr: Peak learning rate (reached after warmup)
+        warmup_steps: Number of linear warmup steps
+        total_steps: Total training steps
+        min_lr_ratio: Minimum LR as fraction of base_lr (default 0.1)
+
+    Returns:
+        Function mapping step number to learning rate
+    """
+    min_lr = base_lr * min_lr_ratio
+
+    def schedule(step: int) -> float:
+        if step < warmup_steps:
+            # Linear warmup from min_lr to base_lr
+            return min_lr + (base_lr - min_lr) * (step + 1) / warmup_steps
+        else:
+            # Cosine decay from base_lr to min_lr
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return min_lr + (base_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return schedule
 
 
 def get_prompt(model_type, processor, conversation):
@@ -60,7 +92,7 @@ class Dataset:
         # the number of tiles, but prepare_inputs may produce different feature counts.
         # Disabling splitting ensures 1 tile = consistent token count.
         model_type = config.get("model_type", "")
-        if model_type in ("idefics3", "smolvlm"):
+        if model_type in ("idefics3", "smolvlm", "lfm2-vl", "lfm2_vl"):
             if hasattr(processor, "image_processor") and hasattr(
                 processor.image_processor, "do_image_splitting"
             ):
@@ -235,13 +267,16 @@ class Trainer:
         optimizer,
         train_on_completions=False,
         assistant_id=77091,
-        clip_gradients=None,
+        clip_gradients=1.0,
+        lr_schedule: Optional[Callable[[int], float]] = None,
     ):
         self.model = model
         self.optimizer = optimizer
         self.train_on_completions = train_on_completions
         self.assistant_id = assistant_id
         self.clip_gradients = clip_gradients
+        self.lr_schedule = lr_schedule
+        self.step = 0
 
     def loss_fn(self, model, batch):
         pixel_values = batch["pixel_values"]
@@ -312,18 +347,30 @@ class Trainer:
         return ce
 
     def train_step(self, batch):
+        # Update learning rate if scheduler provided
+        if self.lr_schedule is not None:
+            new_lr = self.lr_schedule(self.step)
+            self.optimizer.learning_rate = new_lr
+
         loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
         loss, grads = loss_and_grad_fn(self.model, batch)
 
-        # Add gradient clipping
+        # Gradient clipping (enabled by default)
         if self.clip_gradients is not None:
             grads = tree_map(
                 lambda g: mx.clip(g, -self.clip_gradients, self.clip_gradients), grads
             )
 
         self.optimizer.update(self.model, grads)
+        self.step += 1
 
         return loss
+
+    def get_current_lr(self) -> float:
+        """Get current learning rate."""
+        if self.lr_schedule is not None:
+            return self.lr_schedule(self.step)
+        return self.optimizer.learning_rate
 
     @mx.compile
     def train_epoch(self, dataloader):

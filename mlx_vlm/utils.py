@@ -745,6 +745,14 @@ def process_inputs(
     return_tensors="mlx",
     **kwargs,
 ):
+    # Ensure all images are RGB (some PNGs have RGBA which breaks processors)
+    if images is not None:
+        from PIL import Image as _PILImage
+        images = [
+            img.convert("RGB") if isinstance(img, _PILImage.Image) and img.mode != "RGB" else img
+            for img in images
+        ]
+
     # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
     parameters = inspect.signature(process_method).parameters
