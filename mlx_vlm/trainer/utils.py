@@ -125,6 +125,29 @@ def print_trainable_parameters(model):
     )
 
 
+def fuse_vlm_model(model: nn.Module, dequantize: bool = False) -> nn.Module:
+    """Fuse all LoRA layers back to regular Linear layers.
+
+    Args:
+        model: The model with LoRA layers applied.
+        dequantize: If True, return regular Linear layers even if originals were quantized.
+
+    Returns:
+        The model with all LoRA layers replaced by fused Linear layers.
+    """
+    from mlx.utils import tree_unflatten
+
+    fused_modules = []
+    for name, module in model.named_modules():
+        if isinstance(module, LoRaLayer):
+            fused_modules.append((name, module.fuse(dequantize=dequantize)))
+
+    if fused_modules:
+        model.update_modules(tree_unflatten(fused_modules))
+
+    return model
+
+
 def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     """
     Apply LoRA layers to the model.
@@ -153,8 +176,19 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     if hasattr(language_model, 'model'):
         language_model = language_model.model
     list_of_modules = find_all_linear_names(language_model)
+
+    # Extract only the LoRA-specific parameters that get_peft_model expects
+    lora_params = {}
     if config is not None:
-        model = get_peft_model(model, list_of_modules, **config)
+        if "rank" in config:
+            lora_params["rank"] = config["rank"]
+        if "alpha" in config:
+            lora_params["alpha"] = config["alpha"]
+        if "dropout" in config:
+            lora_params["dropout"] = config["dropout"]
+
+    if lora_params:
+        model = get_peft_model(model, list_of_modules, **lora_params)
     else:
         model = get_peft_model(model, list_of_modules)
 

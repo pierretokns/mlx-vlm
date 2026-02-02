@@ -38,6 +38,50 @@ class LoRaLayer(nn.Module):
         lora_update = (self.dropout(x) @ self.A) @ self.B
         return y + (self.alpha * lora_update).astype(x.dtype)
 
+    def fuse(self, dequantize: bool = False):
+        """Fuse LoRA weights into the original layer.
+
+        Args:
+            dequantize: If True, return a regular Linear even if original was quantized.
+
+        Returns:
+            nn.Linear or nn.QuantizedLinear with LoRA weights merged in.
+        """
+        linear = self.original_layer
+        weight = linear.weight
+        is_quantized = isinstance(linear, nn.QuantizedLinear)
+
+        if is_quantized:
+            weight = mx.dequantize(
+                weight,
+                linear.scales,
+                linear.biases,
+                group_size=linear.group_size,
+                bits=linear.bits,
+            )
+
+        output_dims, input_dims = weight.shape
+        bias = "bias" in linear
+        fused_linear = nn.Linear(input_dims, output_dims, bias=bias)
+
+        # Compute fused weight: W' = W + alpha * (A @ B).T
+        # A is (input_dims, rank), B is (rank, output_dims)
+        # Weight is (output_dims, input_dims), so delta needs transpose
+        delta = (self.alpha * (self.A @ self.B)).T.astype(weight.dtype)
+        fused_linear.weight = weight + delta
+
+        if bias:
+            fused_linear.bias = linear["bias"]
+
+        if is_quantized and not dequantize:
+            fused_linear = nn.QuantizedLinear.from_linear(
+                fused_linear,
+                linear.group_size,
+                linear.bits,
+            )
+
+        return fused_linear
+
 
 def replace_lora_with_linear(model):
     for i, layer in enumerate(model.layers):
